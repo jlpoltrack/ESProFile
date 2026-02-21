@@ -3,11 +3,14 @@
  * 2026-02-21
  *
  * Hardware assumptions for this PIO program:
- * - Data Bus (D0-D7) are on contiguous GPIO pins (e.g., GPIO 0-7)
+ * - Data Bus (D0-D7) are on contiguous GPIO pins (GPIO 0-7).
+ * - Parity (D8 / PROFILE_PARITY) must be on GPIO 8 — contiguous with the data bus.
+ *   The profile_write program uses `out pins, 9` to drive all 9 bits at once.
  * - The STRB pin is mapped to the 'jmp' pin for these state machines.
  *
- * NOTE: after editing this file, regenerate profile_bus.pio.h via pioasm:
+ * After editing this file, regenerate profile_bus.pio.h via pioasm:
  *   pioasm profile_bus.pio profile_bus.pio.h
+ * The generated header is committed to the repo so the build does not require pioasm.
  */
 
 // ============================================================================

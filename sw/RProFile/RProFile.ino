@@ -6,7 +6,7 @@
 
 // ProFile bus protocol constants
 #define PROFILE_ACK_PRESENCE  0x01 // drive -> host: "i'm here"
-#define PROFILE_ACK_READ      0x02 // drive -> host: read command acknowledged (cmd + 2)
+#define PROFILE_ACK_READ      0x02 // drive -> host: read command acknowledged
 #define PROFILE_HOST_CONFIRM  0x55 // host -> drive: confirmation byte
 #define PROFILE_ACK_DATA      0x06 // drive -> host: block data received OK
 #define PROFILE_CMD_READ      0x00
@@ -30,12 +30,13 @@
 #define PROFILE_BSY       11 // Busy from Drive
 #define PROFILE_RW        12 // Read/Write
 #define PROFILE_PRES      13 // Presence
-#define PROFILE_PARITY    14 // Parity bit
+#define PROFILE_PARITY    8  // parity (GPIO 8, 9th bit contiguous with data bus D0-D7)
 
-// buffer for DMA
-#define SECTOR_SIZE       532
-#define STATUS_BYTES      4
-#define PROFILE_FRAME_SIZE (STATUS_BYTES + SECTOR_SIZE) // 4 status bytes + 532 data bytes = 536
+// buffer sizes
+#define SECTOR_SIZE           532
+#define STATUS_BYTES          4
+#define PROFILE_FRAME_SIZE    (STATUS_BYTES + SECTOR_SIZE) // 4 status bytes + 532 data bytes = 536
+#define PSRAM_PRELOAD_CHUNK   4096 // chunk size for sequential PSRAM pre-load from SD
 
 // rx: PIO pushes 8-bit data in a 32-bit FIFO word; use uint32_t and extract LSB after DMA
 uint32_t dma_rx_buffer[PROFILE_FRAME_SIZE] __attribute__((aligned(4)));
@@ -103,32 +104,25 @@ void markSectorDirty(uint32_t sector) {
 Adafruit_USBD_MSC usb_msc;
 
 // Callback invoked when received READ10 command.
+// note: MSC operates on raw SD 512-byte sectors; the PSRAM cache uses 532-byte ProFile
+// sector layout and cannot be shared here without address-space corruption. always go to SD.
 int32_t msc_read_cb(uint32_t lba, void* buffer, uint32_t bufsize) {
   uint32_t block_count = bufsize / 512;
-#if USE_PSRAM_CACHE
-  memcpy(buffer, &psram_cache[lba * 512], bufsize);
-#else
   mutex_enter_blocking(&sd_mutex);
-  if(!SDCard.card()) { mutex_exit(&sd_mutex); return -1; }
-  SDCard.card()->readSectors(lba, (uint8_t*) buffer, block_count);
+  if (!SDCard.card()) { mutex_exit(&sd_mutex); return -1; }
+  SDCard.card()->readSectors(lba, (uint8_t*)buffer, block_count);
   mutex_exit(&sd_mutex);
-#endif
   return bufsize;
 }
 
 // Callback invoked when received WRITE10 command.
+// note: see msc_read_cb — MSC always bypasses the PSRAM cache and writes to SD directly.
 int32_t msc_write_cb(uint32_t lba, uint8_t* buffer, uint32_t bufsize) {
   uint32_t block_count = bufsize / 512;
-#if USE_PSRAM_CACHE
-  memcpy(&psram_cache[lba * 512], buffer, bufsize);
-  // mark these sectors as dirty so Core 0's background loop flushes them to SD later
-  for(uint32_t i=0; i<block_count; i++) markSectorDirty(lba + i);
-#else
   mutex_enter_blocking(&sd_mutex);
-  if(!SDCard.card()) { mutex_exit(&sd_mutex); return -1; }
+  if (!SDCard.card()) { mutex_exit(&sd_mutex); return -1; }
   SDCard.card()->writeSectors(lba, buffer, block_count);
   mutex_exit(&sd_mutex);
-#endif
   return bufsize;
 }
 
@@ -139,16 +133,12 @@ bool msc_ready_cb(void) {
 
 // Callback invoked when received a FLUSH command.
 void msc_flush_cb(void) {
-#if !USE_PSRAM_CACHE
   mutex_enter_blocking(&sd_mutex);
-#endif
   if (disk.isOpen()) {
       disk.sync();
       SDCard.card()->syncDevice();
   }
-#if !USE_PSRAM_CACHE
   mutex_exit(&sd_mutex);
-#endif
 }
 
 void setup() {
@@ -174,9 +164,9 @@ void loop() {
   tud_task();
 
 #if USE_PSRAM_CACHE
-  // write-through background flusher
-  // note: sector addressing here is in ProFile 532-byte sectors (not SD 512-byte blocks).
-  // disk I/O is byte-addressed via File32, so seekSet(sector * 532) is correct.
+  // write-through background flusher: dequeues one dirty ProFile sector per loop tick
+  // and persists it to the SD image. sd_mutex guards the File32 disk object which is
+  // also accessed by msc_flush_cb on Core 0.
   uint32_t sector_to_flush = 0xFFFFFFFF;
   bool has_dirty = false;
 
@@ -189,9 +179,11 @@ void loop() {
   mutex_exit(&cache_mutex);
 
   if (has_dirty && disk.isOpen()) {
+      mutex_enter_blocking(&sd_mutex);
       disk.seekSet(sector_to_flush * SECTOR_SIZE);
       disk.write(&psram_cache[sector_to_flush * SECTOR_SIZE], SECTOR_SIZE);
       disk.sync();
+      mutex_exit(&sd_mutex);
   }
 #endif
 
@@ -314,8 +306,7 @@ void setup1() {
       // RP2350 QMI maps PSRAM starting at 0x11000000
       psram_cache = (uint8_t*)0x11000000;
       Serial.println("Loading disk to PSRAM...");
-      // read in 4KB chunks for faster sequential SD throughput
-      #define PSRAM_PRELOAD_CHUNK 4096
+      // read in chunks for faster sequential SD throughput (PSRAM_PRELOAD_CHUNK defined above)
       uint32_t total = disk.fileSize();
       disk.seekSet(0);
       for (uint32_t off = 0; off < total; off += PSRAM_PRELOAD_CHUNK) {
@@ -331,11 +322,18 @@ void setup1() {
 }
 
 void loop1() {
+  // if no media is present, don't participate in the bus at all
+  if (!disk.isOpen()) {
+      delay(100);
+      return;
+  }
+
   takeBusForCPU();
   setBusDirectionOutput(false); // input initially
   digitalWrite(PROFILE_BSY, HIGH); // inactive (active low)
 
   // 1. wait for host to assert CMD (no timeout — idle state)
+  // note: if a watchdog is ever added, wdt_update() will be needed here
   while (digitalRead(PROFILE_CMD) == HIGH) {
     tight_loop_contents();
   }
@@ -443,16 +441,10 @@ void loop1() {
     sendDataCPU(cmd_idx + 0x02); // echo cmd + 2
     digitalWrite(PROFILE_BSY, LOW);
 
-    if (!waitForPinLevel(PROFILE_CMD, HIGH, HANDSHAKE_TIMEOUT)) {
-        pio_sm_set_enabled(profile_pio, sm_read, false);
-        return;
-    }
+    if (!waitForPinLevel(PROFILE_CMD, HIGH, HANDSHAKE_TIMEOUT)) return;
 
     setBusDirectionOutput(false);
-    if (!waitForBusValue(PROFILE_HOST_CONFIRM, HANDSHAKE_TIMEOUT)) {
-        pio_sm_set_enabled(profile_pio, sm_read, false);
-        return;
-    }
+    if (!waitForBusValue(PROFILE_HOST_CONFIRM, HANDSHAKE_TIMEOUT)) return;
 
     digitalWrite(PROFILE_BSY, HIGH); // ready to receive data
 
