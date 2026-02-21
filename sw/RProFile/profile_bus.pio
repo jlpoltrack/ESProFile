@@ -1,0 +1,107 @@
+/**
+ * RProFile RP2350 PIO State Machines
+ * 2026-02-21
+ *
+ * Hardware assumptions for this PIO program:
+ * - Data Bus (D0-D7) are on contiguous GPIO pins (e.g., GPIO 0-7)
+ * - The STRB pin is mapped to the 'jmp' pin for these state machines.
+ *
+ * NOTE: after editing this file, regenerate profile_bus.pio.h via pioasm:
+ *   pioasm profile_bus.pio profile_bus.pio.h
+ */
+
+// ============================================================================
+// Host -> Drive (Read Command / Write Data)
+// ============================================================================
+.program profile_read
+
+; The PIO waits for the host to assert STRB (active low), reads the 8-bit bus,
+; and pushes it to the RX FIFO. It then waits for STRB to be released.
+
+.wrap_target
+wait_low:
+    jmp pin, wait_low      ; JMP pin is mapped to STRB. Loop while STRB is HIGH.
+    
+    ; STRB has gone LOW. The data is valid.
+    in pins, 8             ; Read 8 bits from the data bus (IN pins mapped to D0-D7)
+    
+    ; Note: Apple's protocol includes a PARITY bit. If the PARITY pin is contiguous 
+    ; (e.g. GPIO 8), we could change this to `in pins, 9`. For now, we read 8.
+    
+    push block             ; Push the byte to the RX FIFO for DMA to pick up
+
+wait_high:
+    jmp pin, wait_done     ; Jump out of loop if STRB goes HIGH
+    jmp wait_high          ; Otherwise keep looping while STRB is LOW
+
+wait_done:
+    nop                    ; Implicit wrap takes us back to wait_low
+
+% c-sdk {
+static inline void profile_read_program_init(PIO pio, uint sm, uint offset, uint data_base_pin, uint strb_pin) {
+    pio_sm_config c = profile_read_program_get_default_config(offset);
+    
+    // Set IN base to the start of the 8-bit data bus
+    sm_config_set_in_pins(&c, data_base_pin);
+    
+    // Set the JMP pin to the STRB pin
+    sm_config_set_jmp_pin(&c, strb_pin);
+    
+    // The direction of the 8 data pins is set to INPUT
+    pio_sm_set_consecutive_pindirs(pio, sm, data_base_pin, 8, false);
+    
+    // Set shift direction to right (or left depending on D0-D7 ordering)
+    // Auto-push is disabled (we push manually after waiting for edge)
+    sm_config_set_in_shift(&c, true, false, 8);
+    
+    // Join FIFOs to give a deeper RX FIFO (8 words instead of 4)
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+
+    pio_sm_init(pio, sm, offset, &c);
+}
+%}
+
+
+// ============================================================================
+// Drive -> Host (Read Data)
+// ============================================================================
+.program profile_write
+
+; The PIO pulls a byte from the TX FIFO (serviced by DMA), outputs it to the 
+; data bus, and then waits for the host to acknowledge by pulsing STRB low.
+
+.wrap_target
+    pull block             ; Block until DMA provides a 16-bit word in the TX FIFO
+    out pins, 9            ; Drive the 9 bits (8 Data + 1 Parity) onto the bus
+
+wait_low:
+    jmp pin, wait_low      ; Wait for Host to pull STRB LOW acknowledging it read the byte
+    
+wait_high:
+    jmp pin, wait_done     ; Wait for Host to release STRB HIGH before putting next byte on bus
+    jmp wait_high
+
+wait_done:
+    nop                    ; Implicit wrap will occur here
+
+% c-sdk {
+static inline void profile_write_program_init(PIO pio, uint sm, uint offset, uint data_base_pin, uint strb_pin) {
+    pio_sm_config c = profile_write_program_get_default_config(offset);
+    
+    // Set OUT base to the start of the 8-bit data bus + parity
+    sm_config_set_out_pins(&c, data_base_pin, 9);
+    
+    // Set the JMP pin to the STRB pin
+    sm_config_set_jmp_pin(&c, strb_pin);
+    
+    // The direction of the 9 data pins is set to OUTPUT
+    pio_sm_set_consecutive_pindirs(pio, sm, data_base_pin, 9, true);
+    
+    sm_config_set_out_shift(&c, true, false, 16);
+    
+    // Join FIFOs to give a deeper TX FIFO (8 words instead of 4)
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+
+    pio_sm_init(pio, sm, offset, &c);
+}
+%}
